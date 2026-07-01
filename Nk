@@ -1,0 +1,235 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+🎥 TELEGRAM VIDEO PLAYER BOT – ALL-IN-ONE FILE
+Complete Video Playback with Advanced Controls
+Supports: YouTube, Vimeo, Twitch, Facebook, Instagram, TikTok, Direct MP4/M3U8, 1000+ more
+"""
+
+import os
+import re
+import json
+import glob
+import yt_dlp
+import webbrowser
+import subprocess
+import platform
+import logging
+import asyncio
+from datetime import datetime
+from typing import Dict, Optional, Tuple
+
+# Telegram imports
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    MessageHandler,
+    filters
+)
+
+# ========== CONFIGURATION ==========
+# ⚠️ REPLACE WITH YOUR CREDENTIALS
+BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"  # Get from @BotFather
+API_ID = 12345678  # Get from my.telegram.org
+API_HASH = "your_api_hash_here"  # Get from my.telegram.org
+
+# Bot settings
+DOWNLOAD_PATH = "downloads/"
+LOG_LEVEL = "INFO"
+DEFAULT_PLAYER = "telegram"
+DEFAULT_QUALITY = "720p"
+DEFAULT_SPEED = 1.0
+
+# ========== LOGGING ==========
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=getattr(logging, LOG_LEVEL)
+)
+logger = logging.getLogger(__name__)
+
+# ========== USER SETTINGS STORAGE ==========
+user_settings: Dict[int, dict] = {}
+
+# ========== HELPER FUNCTIONS ==========
+
+def get_stream_url(url: str, quality: str = '720p') -> dict:
+    """
+    Extract video information and stream URL from any platform
+    Supports 1000+ platforms via yt-dlp
+    """
+    quality_map = {
+        '144': '144', '240': '240', '360': '360', '480': '480',
+        '720': '720', '1080': '1080', '1440': '1440', '2160': '2160',
+        'best': 'best'
+    }
+    
+    quality_value = quality_map.get(quality, '720')
+    
+    if quality_value == 'best':
+        format_spec = 'bestvideo+bestaudio/best'
+    else:
+        format_spec = f'bestvideo[height<={quality_value}]+bestaudio/best[height<={quality_value}]'
+    
+    ydl_opts = {
+        'format': format_spec,
+        'quiet': True,
+        'no_warnings': True,
+        'extract_flat': False,
+        'ignoreerrors': True,
+        'no_check_certificate': True,
+        'prefer_insecure': True,
+        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'cookiefile': None,
+    }
+    
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            
+            if info is None:
+                raise Exception("Could not extract video information")
+            
+            # Get video URL
+            video_url = None
+            if 'url' in info:
+                video_url = info['url']
+            elif 'formats' in info and len(info['formats']) > 0:
+                # Get highest quality format
+                video_url = info['formats'][-1]['url']
+            
+            if not video_url:
+                raise Exception("No stream URL found")
+            
+            return {
+                'url': video_url,
+                'title': info.get('title', 'Video'),
+                'thumbnail': info.get('thumbnail', None),
+                'duration': info.get('duration', 0),
+                'view_count': info.get('view_count', 0),
+                'uploader': info.get('uploader', 'Unknown'),
+                'upload_date': info.get('upload_date', 'Unknown'),
+                'description': info.get('description', '')[:200],
+            }
+    
+    except Exception as e:
+        logger.error(f"Error extracting video: {str(e)}")
+        raise e
+
+def format_duration(seconds: int) -> str:
+    """Convert seconds to HH:MM:SS format"""
+    if not seconds:
+        return "Unknown"
+    hours = seconds // 3600
+    minutes = (seconds % 3600) // 60
+    seconds = seconds % 60
+    if hours > 0:
+        return f"{hours}h {minutes}m {seconds}s"
+    else:
+        return f"{minutes}m {seconds}s"
+
+def get_player_emoji(player: str) -> str:
+    """Get emoji for player"""
+    emojis = {
+        'telegram': '🎬',
+        'vlc': '📺',
+        'mx': '📱',
+        'browser': '🌐',
+        'link': '🔗',
+        'download': '📥'
+    }
+    return emojis.get(player, '🎬')
+
+# ========== BOT COMMAND HANDLERS ==========
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Start command - Show main menu"""
+    user_id = update.effective_user.id
+    
+    # Initialize user settings
+    if user_id not in user_settings:
+        user_settings[user_id] = {
+            'speed': DEFAULT_SPEED,
+            'quality': DEFAULT_QUALITY,
+            'cc': False,
+            'screen_fit': 'cover',
+            'hdr': False,
+            'player': DEFAULT_PLAYER,
+            'download_path': DOWNLOAD_PATH
+        }
+    
+    keyboard = [
+        [InlineKeyboardButton("🎬 Telegram Player", callback_data="player_telegram")],
+        [InlineKeyboardButton("📺 VLC Media Player", callback_data="player_vlc")],
+        [InlineKeyboardButton("📱 MX Player", callback_data="player_mx")],
+        [InlineKeyboardButton("🌐 Browser", callback_data="player_browser")],
+        [InlineKeyboardButton("🔗 Get Stream Link", callback_data="player_link")],
+        [InlineKeyboardButton("📥 Download Video", callback_data="player_download")],
+        [InlineKeyboardButton("⚙️ Settings", callback_data="settings_main")],
+        [InlineKeyboardButton("❓ Help", callback_data="help")],
+    ]
+    
+    welcome_text = f"""
+🎥 **Advanced Video Player Bot**
+
+👋 Welcome {update.effective_user.first_name}!
+
+📌 **Commands:**
+• `/play <url>` - Play any video
+• `/settings` - Configure playback
+• `/help` - Get help
+
+🌍 **Supported Platforms:**
+YouTube, Vimeo, Twitch, Facebook, Instagram,
+TikTok, Reddit, Dailymotion, Direct MP4/M3U8,
+and 1000+ more!
+
+⚡ **Features:**
+• Video Speed Control (0.25x - 3.0x)
+• Quality Selection (144p - 4K)
+• Subtitles/CC Support
+• Screen Fit Modes
+• HDR Support
+• Multiple Players
+
+💡 **Quick Start:**
+1. Choose your player below
+2. Use `/play <video_url>`
+3. Adjust settings with `/settings`
+"""
+    
+    await update.message.reply_text(
+        welcome_text,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
+    )
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Help command"""
+    help_text = """
+❓ **Help Guide**
+
+**How to use:**
+1. `/start` - Show main menu
+2. `/play <url>` - Play video from any platform
+3. `/settings` - Configure playback options
+
+**Available Players:**
+• 🎬 **Telegram** - Plays inside Telegram
+• 📺 **VLC** - Opens in VLC desktop player
+• 📱 **MX Player** - Opens on Android
+• 🌐 **Browser** - Opens in web browser
+• 🔗 **Link** - Get direct streaming URL
+• 📥 **Download** - Download video file
+
+**Settings Options:**
+• ⚡ **Speed** - 0.25x to 3.0x playback speed
+• 🎯 **Quality** - 144p to 4K resolution
+• 📝 **CC** - Enable/disable subtitles
+• 📐 **Screen Fit** - Cover/Contain/Stretch/Original
+• 🌈 **HDR** - Toggle HDR mode
+
+**Examples:**
